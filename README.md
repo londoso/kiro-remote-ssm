@@ -1,7 +1,11 @@
-# crew-remote
+# kiro-remote-ssm
 
-Instancia EC2 Graviton (t4g.medium, Amazon Linux 2023 ARM64) para Kiro Crew.
+Instancia EC2 Graviton (t4g.medium, Amazon Linux 2023 ARM64) para Kiro Crew,
+desplegada con CloudFormation + GitHub Actions (OIDC).
 Acceso solo por SSM — sin SSH, sin puertos de entrada. Se apaga sola cada día.
+
+El stack y sus recursos de AWS se llaman `crew-remote` (nombre lógico del
+stack); este repositorio es `kiro-remote-ssm`.
 
 ## Arquitectura
 
@@ -14,7 +18,7 @@ flowchart TB
     end
 
     subgraph SHUTDOWN["Apagado diario"]
-        EB["EventBridge rule<br/>cron 07:00 UTC = 02:00 COT"]
+        EB["EventBridge Scheduler<br/>cron 07:00 UTC = 02:00 COT"]
         LAMBDA["Lambda python3.12 arm64<br/>crew-remote-auto-shutdown"]
         LROLE["IAM Role<br/>SendCommand solo a Name=crew-remote"]
         EB -- invoca --> LAMBDA
@@ -33,7 +37,7 @@ flowchart TB
 | **Security Group** | Solo salida (80/443). Sin puertos de entrada. |
 | **UserData** | Instala kiro-cli + Kiro Crew y levanta el gateway como servicio systemd en el puerto 5476. Corre una sola vez, al primer arranque. |
 | **Lambda `crew-remote-auto-shutdown`** | Python 3.12 ARM. Encuentra la instancia por tag `Name=crew-remote` y le manda `shutdown -h now` por SSM. |
-| **EventBridge rule** | Dispara la Lambda a diario, 07:00 UTC = 02:00 COT. |
+| **EventBridge Scheduler** | Dispara la Lambda a diario, 07:00 UTC = 02:00 COT. Soporta zona horaria nativa (parámetro `ShutdownScheduleTimezone`). |
 | **IAM role (Lambda)** | `SendCommand` limitado a la instancia con tag `Name=crew-remote`. |
 
 ## Flujo de acceso
@@ -124,10 +128,12 @@ arn:aws:iam::123456789012:role/github-oidc-provider-aws
 **Por consola (`gh`):**
 
 ```bash
-gh secret set ROLE_ARN --body "arn:aws:iam::123456789012:role/github-oidc-provider-aws"
+gh secret set ROLE_ARN --repo <tu-usuario>/kiro-remote-ssm \
+  --body "arn:aws:iam::123456789012:role/github-oidc-provider-aws"
 ```
 
-El `123456789012` es un valor dummy: cámbialo por tu account id real.
+El `123456789012` es un valor dummy: cámbialo por tu account id real. Tu
+account id real vive solo en este secreto, nunca en el código del repo.
 
 ## Desplegar
 
