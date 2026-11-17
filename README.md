@@ -105,6 +105,59 @@ Encender la instancia después de un apagado:
 aws ec2 start-instances --instance-ids <INSTANCE_ID> --region us-east-1
 ```
 
+### Dejar la instancia encendida 24/7 (desactivar el apagado diario)
+
+El apagado automático lo dispara un schedule de EventBridge Scheduler
+(`crew-remote-auto-shutdown`). Si quieres que la instancia no se apague, tienes
+tres opciones, de la más temporal a la más permanente:
+
+**1. Desactivar el schedule a mano (rápido, reversible).** Lo pone en `DISABLED`
+sin tocar el stack. Ojo: un redeploy de CloudFormation lo vuelve a `ENABLED`.
+
+```bash
+# Desactivar (deja de apagar la instancia)
+aws scheduler update-schedule --name crew-remote-auto-shutdown \
+  --region us-east-1 --state DISABLED
+
+# Volver a activar
+aws scheduler update-schedule --name crew-remote-auto-shutdown \
+  --region us-east-1 --state ENABLED
+```
+
+> El comando `update-schedule` exige reenviar el resto de la configuración del
+> schedule. Si te da error por campos faltantes, es más cómodo usar la consola
+> (EventBridge → Schedules → `crew-remote-auto-shutdown` → **Disable**) o la
+> opción 2, que lo hace de forma declarativa.
+
+**2. Desactivarlo de forma declarativa en el template (persistente).** Cambia el
+estado del schedule a `DISABLED` en `crew-remote.yaml` y redespliega, así el
+redeploy ya no lo reactiva:
+
+```yaml
+  ShutdownScheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      # ...
+      State: DISABLED        # era ENABLED
+```
+
+**3. Ajustar el horario en vez de apagarlo del todo.** Si solo quieres correr el
+apagado a otra hora o menos seguido, cambia el parámetro `ShutdownSchedule` (cron)
+y, si quieres hora local, `ShutdownScheduleTimezone` (p. ej. `America/Bogota`) al
+desplegar, sin tocar el template:
+
+```bash
+aws cloudformation deploy \
+  --template-file crew-remote.yaml \
+  --stack-name crew-remote \
+  --region us-east-1 \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides ShutdownScheduleTimezone=America/Bogota \
+                        ShutdownSchedule="cron(0 2 * * ? *)"
+```
+
+Recuerda que dejarla encendida 24/7 multiplica el costo de cómputo (ver abajo).
+
 Borrar el stack (p. ej. si quedó en `ROLLBACK_COMPLETE`, que no se puede re-desplegar):
 
 ```bash
@@ -147,3 +200,46 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
+
+## Costos mensuales aproximados
+
+Estimación para **us-east-1**, precios on-demand bajo demanda leídos en
+noviembre de 2026. Son aproximados y sirven de orden de magnitud; mira siempre
+la [calculadora de AWS](https://calculator.aws/) y tu factura real, que varían
+por región, uso de red y descuentos (Savings Plans, free tier de cuenta nueva).
+
+### Qué compone el costo
+
+| Recurso | Precio unitario (us-east-1) | Notas |
+|---|---|---|
+| **EC2 t4g.medium** | ~$0.0336 / hora | Solo se cobra mientras la instancia está **encendida**. Apagada (stopped) no genera costo de cómputo. |
+| **EBS gp3 20 GiB** | $0.08 / GB-mes → **~$1.60 / mes** | Se cobra **siempre**, esté encendida o apagada, mientras el volumen exista. Incluye 3.000 IOPS y 125 MiB/s sin cargo extra. |
+| **EventBridge Scheduler** | $1.00 / millón de invocaciones, tras 14M gratis/mes | 1 disparo diario ≈ 30/mes → **$0.00** (dentro del tramo gratis). |
+| **Lambda (auto-shutdown)** | 1M requests + 400.000 GB-s gratis/mes | ~30 invocaciones de pocos segundos ARM → **$0.00**. |
+| **AWS Systems Manager (SSM)** | Sin costo adicional | Session Manager y SendCommand sobre instancias EC2 estándar no tienen cargo. |
+| **Transferencia de datos de salida** | Primeros 100 GB/mes gratis, luego ~$0.09/GB | El tráfico de control de Kiro Crew es bajo; normalmente **~$0**. |
+
+El cómputo de EC2 es la única partida que escala con el uso. Todo lo demás
+(Scheduler, Lambda, SSM) cae dentro del free tier para este patrón de uso, y el
+EBS es un fijo de ~$1.60/mes.
+
+### Escenarios
+
+Tomando EC2 a $0.0336/h + EBS fijo ~$1.60/mes (730 h = 1 mes):
+
+| Uso de la instancia | Horas EC2/mes | Cómputo EC2 | + EBS | **Total aprox./mes** |
+|---|---|---|---|---|
+| **2 h/día** (encender para trabajar, apagado diario hace el resto) | ~60 h | ~$2.02 | $1.60 | **~$3.6** |
+| **8 h/día laborables** (~22 días) | ~176 h | ~$5.91 | $1.60 | **~$7.5** |
+| **12 h/día todos los días** | ~365 h | ~$12.26 | $1.60 | **~$13.9** |
+| **24/7** (apagado diario desactivado) | 730 h | ~$24.53 | $1.60 | **~$26.1** |
+
+El apagado automático diario existe precisamente para mantenerte cerca de las
+primeras filas: si olvidas apagar, el schedule la apaga de madrugada y evitas
+pagar la instancia encendida sin usarla. Dejarla **24/7** (ver sección anterior)
+es la opción más cara, ~$26/mes.
+
+> **Reducir costo aún más:** si no vas a usarla por un tiempo largo, borra el
+> stack (`aws cloudformation delete-stack`, ver arriba) para dejar de pagar
+> también el EBS. Un Compute Savings Plan o una instancia reservada pueden
+> bajar el precio del cómputo ~30–40% si el uso es constante.
