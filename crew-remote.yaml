@@ -1,0 +1,333 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Crew remote EC2 (Graviton t4g.medium) managed via SSM.
+  Egress-only security group, IMDSv2 required, reuses existing
+  SSMInstanceProfile. No inbound ports. No SSH key needed.
+  UserData installs kiro-cli + Kiro Crew from the official
+  installers and runs the gateway as a systemd service. A daily
+  EventBridge Scheduler schedule triggers an ARM Python Lambda that
+  powers the box off via SSM SendCommand (shutdown moved out of the
+  instance).
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    Description: Graviton instance type.
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-07890d146f8d6ee5b
+    Description: Amazon Linux 2023 ARM64 AMI (us-east-1).
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Public subnet id (needs internet egress for SSM), e.g. subnet-0123456789abcdef0.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      VPC id for the security group, e.g. vpc-0123456789abcdef0.
+  InstanceProfileName:
+    Type: String
+    Default: SSMInstanceProfile
+    Description: Existing IAM instance profile with AmazonSSMManagedInstanceCore.
+  VolumeSizeGb:
+    Type: Number
+    Default: 20
+    Description: Root EBS volume size in GiB.
+  GatewayPort:
+    Type: Number
+    Default: 5476
+    Description: >
+      Loopback port the Kiro Crew gateway listens on. Must match the
+      "Remote port" field in Settings -> Remote Crew (5476 by default).
+  ShutdownSchedule:
+    Type: String
+    Default: "cron(0 7 * * ? *)"
+    Description: >
+      EventBridge Scheduler schedule expression for the daily auto-shutdown
+      Lambda. Default cron(0 7 * * ? *) = 07:00 UTC = 02:00 COT, every day.
+  ShutdownScheduleTimezone:
+    Type: String
+    Default: UTC
+    Description: >
+      Timezone for the shutdown schedule expression (EventBridge Scheduler
+      supports a timezone; the legacy rule did not). Use e.g. America/Bogota
+      to express the cron in local time instead of UTC.
+
+Resources:
+  CrewRemoteSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: crew-remote-ssm-sg
+      GroupDescription: Crew remote EC2 egress only SSM access
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS egress for SSM and package updates
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP egress for package repos
+      Tags:
+        - Key: Name
+          Value: crew-remote-ssm-sg
+        - Key: purpose
+          Value: crew-remote-ssm
+
+  CrewRemoteInstanceV2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref ImageId
+      IamInstanceProfile: !Ref InstanceProfileName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          SubnetId: !Ref SubnetId
+          AssociatePublicIpAddress: true
+          GroupSet:
+            - !Ref CrewRemoteSG
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSizeGb
+            VolumeType: gp3
+            DeleteOnTermination: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -uxo pipefail
+          exec > >(tee -a /var/log/crew-bootstrap.log) 2>&1
+          echo "=== crew-remote bootstrap $(date -u) ==="
+
+          # Auto-shutdown moved OUT of the instance: a daily EventBridge rule
+          # triggers an ARM Python Lambda that runs `shutdown -h now` via SSM.
+
+          # ---- 1. System packages (Amazon Linux 2023 ARM64) ----
+          dnf install -y git tmux unzip python3.12 python3.12-pip
+          # Node.js 22 for the dashboard bundle build
+          curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+          dnf install -y nodejs
+
+          # ---- 2. Install as ec2-user (installers write to the user's $HOME) ----
+          HOME_DIR=/home/ec2-user
+          sudo -iu ec2-user bash <<'EOS'
+          set -uxo pipefail
+          # kiro-cli (official installer, Linux aarch64)
+          curl -fsSL https://cli.kiro.dev/install | bash
+          # Kiro Crew: install.sh must run from INSIDE a repo clone
+          # (it installs from the repo's pyproject.toml, not as a remote installer).
+          cd "$HOME"
+          rm -rf "$HOME/KiroCrew"
+          git clone --depth 1 https://github.com/kirodotdev/KiroCrew.git "$HOME/KiroCrew"
+          cd "$HOME/KiroCrew"
+          # The dashboard IS the product for a cloud crew, so make a failed
+          # frontend build fatal (installer retries) instead of a silent fallback.
+          KIROCREW_REQUIRE_FRONTEND=1 bash install.sh
+          EOS
+
+          # ---- 3. Run the Kiro Crew gateway as a systemd service ----
+          # Resolve the installed kirocrew binary (installer target varies).
+          KC=""
+          for c in \
+            /home/ec2-user/.local/bin/kirocrew \
+            /home/ec2-user/.kirocrew-app/.venv/bin/kirocrew \
+            /home/ec2-user/KiroCrew/.venv/bin/kirocrew; do
+            [ -x "$c" ] && KC="$c" && break
+          done
+          if [ -n "$KC" ]; then
+            cat > /etc/systemd/system/kirocrew.service <<UNIT
+          [Unit]
+          Description=Kiro Crew gateway
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=ec2-user
+          Group=ec2-user
+          Environment=HOME=/home/ec2-user
+          Environment=PATH=/home/ec2-user/.local/bin:/usr/local/bin:/usr/bin:/bin
+          Environment=KIROCREW_PORT=${GatewayPort}
+          ExecStart=$KC gateway
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+            systemctl daemon-reload
+            systemctl enable --now kirocrew.service
+          else
+            echo "WARNING: kirocrew binary not found after install; gateway not started" >&2
+          fi
+
+          echo "=== crew-remote bootstrap done $(date -u) ==="
+      Tags:
+        - Key: Name
+          Value: crew-remote
+        - Key: purpose
+          Value: crew-remote-ssm
+
+  # ---- Daily auto-shutdown: EventBridge -> ARM Python Lambda -> SSM ----
+  ShutdownLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: crew-remote-shutdown-lambda
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ssm-shutdown
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Discover the instance by its Name tag.
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: "*"
+              # Allow using the shell-script document (no tag condition:
+              # the document itself carries no Name tag, so a condition here
+              # would deny the whole SendCommand call).
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript"
+              # Restrict the target instance to the tagged one.
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "ssm:resourceTag/Name": crew-remote
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                Resource: "*"
+
+  ShutdownLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: crew-remote-auto-shutdown
+      Description: Powers off the crew-remote instance daily via SSM.
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt ShutdownLambdaRole.Arn
+      Environment:
+        Variables:
+          INSTANCE_NAME_TAG: crew-remote
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          NAME_TAG = os.environ.get("INSTANCE_NAME_TAG", "crew-remote")
+          ec2 = boto3.client("ec2")
+          ssm = boto3.client("ssm")
+
+
+          def handler(event, context):
+              # Find running instances tagged Name=crew-remote.
+              resp = ec2.describe_instances(
+                  Filters=[
+                      {"Name": "tag:Name", "Values": [NAME_TAG]},
+                      {"Name": "instance-state-name", "Values": ["running"]},
+                  ]
+              )
+              ids = [
+                  i["InstanceId"]
+                  for r in resp["Reservations"]
+                  for i in r["Instances"]
+              ]
+              if not ids:
+                  print(f"No running instance tagged Name={NAME_TAG}; nothing to do.")
+                  return {"shutdown": [], "note": "no running instance"}
+
+              # Tell the OS to power off; EC2 then stops the instance.
+              cmd = ssm.send_command(
+                  InstanceIds=ids,
+                  DocumentName="AWS-RunShellScript",
+                  Comment="crew-remote daily auto-shutdown",
+                  Parameters={"commands": ["/sbin/shutdown -h now"]},
+              )
+              command_id = cmd["Command"]["CommandId"]
+              print(f"Sent shutdown to {ids} (command {command_id})")
+              return {"shutdown": ids, "command_id": command_id}
+
+  # Role EventBridge Scheduler assumes to invoke the Lambda. The modern
+  # Scheduler service invokes targets with an IAM role instead of the
+  # resource-based Lambda::Permission used by legacy Events::Rule targets.
+  ShutdownSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: crew-remote-shutdown-scheduler
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-shutdown-lambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ShutdownLambda.Arn
+
+  ShutdownScheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: crew-remote-auto-shutdown
+      Description: Daily trigger for the crew-remote auto-shutdown Lambda.
+      ScheduleExpression: !Ref ShutdownSchedule
+      ScheduleExpressionTimezone: !Ref ShutdownScheduleTimezone
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt ShutdownLambda.Arn
+        RoleArn: !GetAtt ShutdownSchedulerRole.Arn
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance id (CloudFormation output requested).
+    Value: !Ref CrewRemoteInstanceV2
+  SecurityGroupId:
+    Description: Egress-only security group id.
+    Value: !Ref CrewRemoteSG
+  ShutdownLambdaName:
+    Description: Lambda that powers the instance off daily via SSM.
+    Value: !Ref ShutdownLambda
+  SsmStartSession:
+    Description: Command to connect via SSM.
+    Value: !Sub "aws ssm start-session --target ${CrewRemoteInstanceV2} --region ${AWS::Region} --profile anderson"
+  KiroCliLoginReminder:
+    Description: One-time manual step after the stack is CREATE_COMPLETE.
+    Value: "Connect via SSM, then as ec2-user run: kiro-cli login  (browser/device auth; cannot run in UserData)."
